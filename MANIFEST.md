@@ -1,8 +1,9 @@
 # workbuddy-to-dsh 桥接插件快照 · 2026-11-08
 
-> **状态**：本地快照 7 文件已逐文件 md5 校验；配套 ZIP 用于上传到 GitHub 仓库 `NOBBUP/PREES-E` 作远端副本。
-> 本机 GitHub 集成对该账号仓库无写权限（`create_repository` 403、`get_file_contents` / `push_files` 404），
-> 故远端副本由宿主在网页手动上传 ZIP。本快照不含凭据、令牌、日志、会话数据或工作台规则文件。
+> **状态**：本地快照 7 文件已逐文件 md5 校验；配套 ZIP 作为 GitHub 仓库
+> `NOBBUP/lintax-dsh-bridge-backup-20261108` 的远端备份副本，由宿主在网页上传。
+> 本机 GitHub 集成对该账号仓库只有读权限（`push_files` / `create_or_update_file` 均 403），
+> 无法由 AI 直推。本快照不含凭据、令牌、日志、会话数据或工作台规则文件。
 
 ## 版本标识
 
