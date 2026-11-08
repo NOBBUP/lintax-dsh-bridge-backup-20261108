@@ -316,7 +316,10 @@ function channelFallbackCandidates(payload) {
     if (sink) {
       push(sink.strategy, sink.payload.messages);
       log(`channel fallback: ${sink.strategy} keeps ${sink.stats.movedChars} chars`
-        + ` from ${sink.stats.movedCount} system message(s)`);
+        + ` from ${sink.stats.movedCount} system message(s)`
+        + ` | history -${sink.stats.historyRemoved || 0} msg(s)`
+        + ` / -${sink.stats.historyRemovedChars || 0} chars`
+        + ` boundary=${sink.stats.historyBoundary ? 1 : 0}`);
     }
   }
 
