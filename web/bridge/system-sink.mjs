@@ -112,15 +112,23 @@ const NO_ACTION_RE = /不要(?:读文件|调用工具|做任何事|做别的事|
 const BUSY_RE = /(?:然后|接着|之后|再去|并|以及)\s*(?:去|执行|检查|读取|写入|跑|派单|闭环|交付|查|改)/;
 
 /**
- * 在 messages 里找宿主最近一条「给死答案」的 user 原话。
+ * 只在「本轮最后一段连续 user 消息」里找给死答案的宿主原话。
  * 只按文本判定：桥拿到的 OpenAI payload 没有 source.kind 字段，
  * 不能用会话事件流里的 kind 去筛。返回 '' 表示这不是 A 类轮。
+ *
+ * ★ 12:09 真机回归修复：原实现从尾到头遍历整个 messages，
+ *   最后一条是真实问题但历史里存在自动唤醒句时，会翻旧账返回那句模板，
+ *   轻链出站只发模板 ⇒ 宿主真实请求被整条丢掉（回「已连接」而不排查）。
+ *   因此一旦退到上一轮的 assistant/tool 回复，立即停止，绝不跨轮翻找。
  */
 export function findDeadAnswer(messages) {
   if (!Array.isArray(messages)) return '';
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const m = messages[i];
-    if (!m || m.role !== 'user') continue;
+    if (!m) continue;
+    // 跨轮即止：assistant / tool 属于上一轮的回复，再往前就是旧历史。
+    if (m.role === 'assistant' || m.role === 'tool') return '';
+    if (m.role !== 'user') continue;
     const text = messageText(m.content).trim();
     if (!text || text.length > 300) continue;
     if (!DEAD_ANSWER_RE.test(text) && !/不要思考|不要推理|不写推理/.test(text)) continue;
@@ -309,6 +317,23 @@ function 自测() {
     '★ 正常业务单不得被认成 A 类');
   判(findDeadAnswer([{ role: 'user', content: '回一句已连接即可，然后去检查日志' }]) === '',
     '★ 带后续动作的「回一句」不得走轻链');
+  // ── 12:09 真机回归：历史自动唤醒句不得劫持新的真实请求 ──────────────
+  const 真实问题 = '左上角workbuddy还是打不开，查看一下什么情况？这条不是已连接';
+  const 被劫持轮 = [
+    { role: 'system', content: 规则 },
+    { role: 'user', content: A句 },
+    { role: 'assistant', content: '已连接' },
+    { role: 'user', content: 真实问题 },
+  ];
+  判(findDeadAnswer(被劫持轮) === '', '★ 历史里的自动唤醒句不得劫持新的真实问题');
+  判(buildSystemSinkMessages(被劫持轮).light !== true, '★ 真实问题轮不得走轻链');
+  判(JSON.stringify(buildSystemSinkMessages(被劫持轮).messages).includes('打不开'),
+    '★ 真实问题必须留在出站 payload 里');
+  判(findDeadAnswer([
+    { role: 'system', content: 规则 },
+    { role: 'user', content: A句 },
+    { role: 'user', content: 'time-context: 运行时内务信息' },
+  ]) === A句, '★ 同轮引擎注入不挡住 A 类识别');
   const 轻 = buildSystemSinkMessages(A轮);
   判(轻 !== null && 轻.light === true, '★ A 类轮必须命中轻链');
   判(轻.messages.length === 2, '★ 轻链出站只能有中性 system + 宿主那一句');
