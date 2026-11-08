@@ -1,10 +1,8 @@
 # workbuddy-to-dsh 桥接插件快照 · 2026-11-08
 
-> **状态：本地快照已就绪，GitHub 远端尚未上传。**
-> 实测三条路均被挡：集成 `create_repository` 403（GitHub App 无权建仓）、
-> `get_file_contents` / `push_files` 404（目标仓库不存在）、本地 `git push` 无 GitHub 凭据。
-> 需宿主在 GitHub 网页手动建一个**已初始化默认分支**的空仓库（建议 private 且勾 Add a README），
-> 再由集成 `push_files` 直接推这 7 个文件；无需本地凭据。
+> **状态**：本地快照 7 文件已逐文件 md5 校验；配套 ZIP 用于上传到 GitHub 仓库 `NOBBUP/PREES-E` 作远端副本。
+> 本机 GitHub 集成对该账号仓库无写权限（`create_repository` 403、`get_file_contents` / `push_files` 404），
+> 故远端副本由宿主在网页手动上传 ZIP。本快照不含凭据、令牌、日志、会话数据或工作台规则文件。
 
 ## 版本标识
 
