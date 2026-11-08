@@ -279,11 +279,32 @@ const SYSTEM_SINK = readSinkConfig(process.env);
  * 所以兜底能力不减。⚠ 代价要如实记：若上游本可接受完整 system，改后规则会以
  * user 身份进模型（优先级低于 system）；用 WORKBUDDY_SINK_FIRST=0 可一键 A/B 回退。
  *
- * 首发一律禁用 A 类轻链：轻链只保留在 11128 兜底链里。历史教训（12:09 真实
- * 问题被 3 秒回成「已连接」）说明误判轻链放在首发位置会吃掉真业务单。
+ * 首发 A 类轻链由 WORKBUDDY_SINK_FIRST_A_LIGHT 控制（默认开，详见第 6 刀注释）。
  */
 const SYSTEM_SINK_FIRST = process.env.WORKBUDDY_SINK_FIRST !== '0';
-const SINK_FIRST_SINK_ENV = { ...process.env, WORKBUDDY_A_LIGHT: '0' };
+/**
+ * ★ 第 6 刀（2026-11-08）：首发链恢复 A 类轻链的安全命中。
+ *   12:09 的跨轮误判已在 findDeadAnswer() 修好 —— 只在本轮最后一段连续 user
+ *   消息内判定，遇 assistant/tool 立即 return ''；自测有「真实问题轮不得走轻链」
+ *   「带后续动作的回一句不得走轻链」等反例，因此轻链放回首发是安全的。
+ *   ★ 真机依据（19:02）：第 5 刀撤掉历史边界注记后，ai-workbench / oa-ops 两个
+ *   老会话在「回一句已连接，不要调用工具」的唤醒轮里翻出旧效率催办令，
+ *   花 33413 / 59969 字裁决并调 compress，耗时 214.6s / 262s，违背本轮指令。
+ *   唤醒轮首发即走轻链 ⇒ 只发中性 system + 宿主那一句，规则与历史都不进模型，
+ *   旧令无从复燃，顺带消掉净版 15484 字规则带来的短轮变慢。
+ *   ⛔ WORKBUDDY_SINK_FIRST_A_LIGHT=0 一键回到「首发一律禁轻链」的第 5 刀行为。
+ */
+const SINK_FIRST_A_LIGHT = process.env.WORKBUDDY_SINK_FIRST_A_LIGHT !== '0';
+const SINK_FIRST_SINK_ENV = SINK_FIRST_A_LIGHT
+  ? process.env
+  : { ...process.env, WORKBUDDY_A_LIGHT: '0' };
+/**
+ * ★ 第 5 刀：首发改用「净版逐字下沉」——零裁决抬头、零边界注记、不摘要、不禁 compress。
+ *   真机 turn21 逐字命中三刀抬头「宿主最近一句指令」13 次、「历史边界」11 次、
+ *   「不续跑」9 次，25.6 分钟 0 回复 0 交付；「压缩内务不裁决」还疑似压掉 compress 自救。
+ *   ⛔ WORKBUDDY_SINK_PLAIN=0 可一键回到三刀版做真机 A/B。
+ */
+const SINK_PLAIN_FIRST = process.env.WORKBUDDY_SINK_PLAIN !== '0';
 /**
  * assistant 历史也做**精确身份模板**中和（默认开）。
  *
@@ -335,14 +356,18 @@ function channelFallbackCandidates(payload, opts = {}) {
   //    opts.sinkEnv 只用于首发：强制关掉 A 类轻链，避免误判吃掉真业务单；
   //    不传时完全沿用进程环境（11128 兜底链行为一字不变）。
   if (SYSTEM_SINK.enabled) {
-    const sink = sinkCandidate(payload, { neutralSystem: NEUTRAL_SYSTEM, env: opts.sinkEnv });
+    const sink = sinkCandidate(payload, {
+      neutralSystem: NEUTRAL_SYSTEM, env: opts.sinkEnv, plain: opts.plain,
+    });
     if (sink) {
       push(sink.strategy, sink.payload.messages);
       log(`channel fallback: ${sink.strategy} keeps ${sink.stats.movedChars} chars`
         + ` from ${sink.stats.movedCount} system message(s)`
         + ` | history -${sink.stats.historyRemoved || 0} msg(s)`
         + ` / -${sink.stats.historyRemovedChars || 0} chars`
-        + ` boundary=${sink.stats.historyBoundary ? 1 : 0}`);
+        + ` boundary=${sink.stats.historyBoundary ? 1 : 0}`
+        + ` plain=${sink.stats.plain ? 1 : 0}`
+        + ` light=${sink.stats.light ? 1 : 0}`);
     }
   }
 
@@ -403,7 +428,7 @@ function channelFallbackCandidates(payload, opts = {}) {
 }
 
 /**
- * 首发链（桥本体第 4 刀）：sink（非轻链）→ 原版全部降级候选 → original-payload。
+ * 首发链（桥本体第 4 刀 + 第 6 刀）：sink（A 类命中时为 a-light）→ 原版全部降级候选 → original-payload。
  *
  * 只**构造**候选、不发请求；首包仍由调用方正常取限流许可。返回 null 表示
  * 完全不启用首发（开关关 / sink 关 / 这条 payload 没有 system / 构造不出 sink），
@@ -414,8 +439,13 @@ function firstSinkCandidates(payload) {
   const messages = Array.isArray(payload?.messages) ? payload.messages : [];
   const hasSystem = messages.some((m) => m && (m.role === 'system' || m.role === 'System'));
   if (!hasSystem) return null;
-  const cs = channelFallbackCandidates(payload, { sinkEnv: SINK_FIRST_SINK_ENV });
-  const at = cs.findIndex((c) => c.strategy === 'system-rules-sink');
+  const cs = channelFallbackCandidates(payload, {
+    sinkEnv: SINK_FIRST_SINK_ENV, plain: SINK_PLAIN_FIRST,
+  });
+  // 第 6 刀：A 类命中时 sinkCandidate 返回 `system-rules-sink:a-light`，
+  // 必须一并认作首发候选；否则 findIndex=-1 ⇒ 首发链返回 null ⇒ 退回撞 11128 的老路。
+  const at = cs.findIndex((c) => c.strategy === 'system-rules-sink'
+    || c.strategy === 'system-rules-sink:a-light');
   if (at < 0) return null;
   return [cs[at], ...cs.slice(0, at), ...cs.slice(at + 1),
     { strategy: 'original-payload', payload }];

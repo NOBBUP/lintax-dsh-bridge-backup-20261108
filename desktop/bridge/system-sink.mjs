@@ -425,23 +425,35 @@ export function buildSystemSinkMessages(messages, opts = {}) {
     }
   }
 
-  // ★ 第 2 刀：默认摘要（在结构化层砍掉「逐条裁决」的对象）；=0 逐字全量回退。
+  // ★ 第 5 刀（2026-11-08 净版逐字下沉）：由桥本体首发链显式传 opts.plain。
+  //   零抬头 / 零后缀 / 零边界注记 / 不摘要 —— 规则消息就是 rules 本身
+  //   （即第 1 刀剥完引擎 ACP 压缩内务模板后的逐字原文）。
+  //   ⛔ 绝不写「优先级」「不裁决」「不续跑」「不调用 compress」这类裁决词：
+  //   真机 turn21 的 reasoning 逐字命中「宿主最近一句指令」13 次、
+  //   「历史边界」11 次、「不续跑」9 次，25.6 分钟 0 回复 0 交付；
+  //   且「压缩内务不规划、不裁决」疑似压掉了 compress 自救。
+  //   ⛔ plain=false 时一字不改地回到第 2/3 刀原行为，便于真机 A/B。
+  const plain = opts.plain === true;
+
+  // ★ 第 2 刀：默认摘要（净版不走）；=0 逐字全量回退。
   //   放在 A 类轻链之后 ⇒ 轻链完全不受影响，仍是中性 system + 宿主那一句。
-  const sum = readSummaryConfig(opts.env).enabled
+  const sum = !plain && readSummaryConfig(opts.env).enabled
     ? summarizeRules(rules, lastHostText(messages))
     : null;
-  const outbound = sum
-    ? sum.text
-    : `${SYSTEM_SINK_PREFIX}\n${rules}\n${SYSTEM_SINK_SUFFIX}`;
+  const outbound = plain
+    ? rules
+    : sum
+      ? sum.text
+      : `${SYSTEM_SINK_PREFIX}\n${rules}\n${SYSTEM_SINK_SUFFIX}`;
 
-  // ★ 第 3 刀：出站历史清洗 + 边界注记（默认开，=0 完全回退）。
+  // ★ 第 3 刀：出站历史清洗（结构化层，两模式都保留）；边界注记只在非净版追加。
   //   A 类轻链在上面已 return，这里只影响「带历史」的完整下沉链。
   const cleanOn = readHistoryCleanConfig(opts.env).enabled;
   const rest = messages.filter((m) => !isSystemMessage(m));
   const cleaned = cleanOn
     ? cleanHistoryMessages(rest)
     : { messages: rest, removed: 0, removedChars: 0, removedKinds: [] };
-  const finalOutbound = cleanOn ? `${outbound}\n${HISTORY_BOUNDARY_NOTE}` : outbound;
+  const finalOutbound = (cleanOn && !plain) ? `${outbound}\n${HISTORY_BOUNDARY_NOTE}` : outbound;
   return {
     messages: [
       { role: 'system', content: neutralSystem },
@@ -458,7 +470,8 @@ export function buildSystemSinkMessages(messages, opts = {}) {
     historyRemoved: cleaned.removed,
     historyRemovedChars: cleaned.removedChars,
     historyRemovedKinds: cleaned.removedKinds,
-    historyBoundary: cleanOn,
+    historyBoundary: cleanOn && !plain,
+    plain,
   };
 }
 
@@ -489,6 +502,7 @@ export function sinkCandidate(payload, opts = {}) {
       historyRemoved: built.historyRemoved || 0,
       historyRemovedChars: built.historyRemovedChars || 0,
       historyBoundary: Boolean(built.historyBoundary),
+      plain: Boolean(built.plain),
     },
   };
 }
@@ -828,6 +842,42 @@ function 自测() {
     '★ 轻链候选必须在日志里可识别（keeps 0 chars）');
   判(sinkCandidate({ model: 'm', messages: 原始 }).strategy === SYSTEM_SINK_STRATEGY,
     '★ 普通请求的候选 strategy 不得被改');
+
+  // ── 第 5 刀：净版逐字下沉（拆了这一刀就该红）─────────────────────────
+  const 净轮 = buildSystemSinkMessages(办事项, { env: {}, plain: true });
+  判(净轮.plain === true, '★ 净版必须带 plain 标记');
+  判(净轮.messages[1].content === 大规则,
+    '★ 净版规则消息必须逐字等于剥完模板的原文，零抬头零后缀');
+  判(!净轮.messages[1].content.includes('【优先级】')
+    && !净轮.messages[1].content.includes('宿主最近一句'),
+    '★ 净版不得带裁决式抬头（真机 turn21 逐字命中 13 次）');
+  判(!净轮.messages[1].content.includes('历史边界')
+    && !净轮.messages[1].content.includes('不续跑'),
+    '★ 净版不得带历史边界注记（真机命中 11 次）');
+  判(!净轮.messages[1].content.includes('不调用 compress')
+    && !净轮.messages[1].content.includes('不规划压缩'),
+    '★ 净版不得禁止 compress 自救');
+  判(净轮.summarized === false && 净轮.historyBoundary === false,
+    '★ 净版不摘要、不加边界注记');
+  判(净轮.movedChars === 大规则.length,
+    '★ 净版 movedChars 必须等于逐字原文长度（真机 keeps N chars 会变大）');
+  判(JSON.stringify(净轮.messages).includes('修复哨兵并给出回执，按规矩办事'),
+    '★ 宿主原话仍原样保留');
+  const 净脏 = buildSystemSinkMessages(脏轮, { env: {}, plain: true });
+  判(净脏.historyRemoved === 3, '★ 净版仍保留第 3 刀结构化历史清洗');
+  判(!JSON.stringify(净脏.messages).includes('历史边界'),
+    '★ 清洗保留但裁决式注记不追加');
+  判(!JSON.stringify(净脏.messages).includes('Time sampled while preparing turn'),
+    '★ 净版仍剥掉 time-context 快照');
+  const 净候选 = sinkCandidate({ model: 'm', messages: 办事项 }, { env: {}, plain: true });
+  判(净候选.stats.plain === true, '★ 候选 stats 必须带 plain 标记，便于真机验收');
+  判(buildSystemSinkMessages(净轮.messages, { env: {}, plain: true }) === null,
+    '★ 净版同样幂等');
+  判(buildSystemSinkMessages(A轮, { env: {}, plain: true }).light === true,
+    '★ A 类轻链优先级高于净版，不受影响');
+  const 回退版 = buildSystemSinkMessages(办事项, { env: {}, plain: false });
+  判(回退版.plain === false && 回退版.summarized === true,
+    '★ plain=false 必须一字不改回到三刀摘要版');
 
   if (红.length) {
     console.error(`system-sink --自测 ${总 - 红.length}/${总}：\n - ` + 红.join('\n - '));

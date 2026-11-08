@@ -679,6 +679,10 @@ export const BRIDGE_ENV_PASSTHROUGH = Object.freeze([
   'WORKBUDDY_SYSTEM_SINK',
   // 桥本体首发形态（默认开，0 = 回到「首包撞 11128 再降级」的改前行为）
   'WORKBUDDY_SINK_FIRST',
+  // 净版逐字下沉（默认开，0 = 首发回到第 2/3 刀摘要 + 抬头 + 边界注记）
+  'WORKBUDDY_SINK_PLAIN',
+  // 首发链恢复 A 类轻链安全命中（默认开，0 = 首发一律禁轻链，真机 A/B 用）
+  'WORKBUDDY_SINK_FIRST_A_LIGHT',
   // 下沉链的四个细分开关（默认均开，0 = 分项回退，真机 A/B 用）
   'WORKBUDDY_A_LIGHT',
   'WORKBUDDY_STRIP_HOUSEKEEPING',
