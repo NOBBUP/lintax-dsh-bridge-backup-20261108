@@ -264,6 +264,27 @@ const NEUTRAL_SYSTEM = 'You are a helpful AI assistant.';
 // 默认开；WORKBUDDY_SYSTEM_SINK=0 可整体回退到原版 11128 降级链（真机 A/B 用）。
 const SYSTEM_SINK = readSinkConfig(process.env);
 /**
+ * ★ 2026-11-08 桥本体第 4 刀：把 system-rules-sink 从「11128 之后的降级候选」
+ *   提升为「默认首发形态」。宿主裁决：问题在插件通道，不在工作台底层逻辑；
+ *   ⛔ 不改模型、不降档、不走原生 provider，workbuddy 积分照用。
+ *
+ * 真机取证（bridge.log）：上游 11128 是稳定存在的通道模板校验。改前每一轮都
+ * 先发完整 system 撞一次 11128，再降级到 sink；sticky 只在同会话连续 2 次
+ * 11128 后才提前，桥一重启就清零；normalizePayload 还逐轮改写 system 原文。
+ * 首发直发 sink 后：① 省掉每轮一次必失败的 11128 往返；② 不再有机会落到
+ * neutral-system（整段 system 换中性句、规则全丢）；③ 规则以 user 规则消息
+ * 进模型，不再被模板改写反复篡改。
+ *
+ * 原 payload 作为兜底链最后一档 original-payload 保留，原 4 个降级候选一个不少，
+ * 所以兜底能力不减。⚠ 代价要如实记：若上游本可接受完整 system，改后规则会以
+ * user 身份进模型（优先级低于 system）；用 WORKBUDDY_SINK_FIRST=0 可一键 A/B 回退。
+ *
+ * 首发一律禁用 A 类轻链：轻链只保留在 11128 兜底链里。历史教训（12:09 真实
+ * 问题被 3 秒回成「已连接」）说明误判轻链放在首发位置会吃掉真业务单。
+ */
+const SYSTEM_SINK_FIRST = process.env.WORKBUDDY_SINK_FIRST !== '0';
+const SINK_FIRST_SINK_ENV = { ...process.env, WORKBUDDY_A_LIGHT: '0' };
+/**
  * assistant 历史也做**精确身份模板**中和（默认开）。
  *
  * 同类项目已实测（hub #574）：assistant 历史里只要出现
@@ -291,7 +312,7 @@ const TOOL_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
  * user / tool / tools 永远不动。返回**去重后的候选列表**；调用方只在仍收到
  * 11128 时才继续试下一个。
  */
-function channelFallbackCandidates(payload) {
+function channelFallbackCandidates(payload, opts = {}) {
   if (!CHANNEL_FALLBACK_ENABLED) return [];
   const messages = Array.isArray(payload?.messages) ? payload.messages : [];
   const isSystem = (m) => m && (m.role === 'system' || m.role === 'System');
@@ -306,13 +327,15 @@ function channelFallbackCandidates(payload) {
     out.push({ strategy, payload: { ...payload, messages: nextMessages } });
   };
 
-  // 0) ★ 2026-11-07 system-rules-sink：11128 时先试「完整规则下沉」。
-  //    正常请求（上游没拦）根本不会走到本函数，system 原样发送、一个字节不改。
-  //    命中 11128 时，第一候选把全部 system 原文逐字搬进一条权威 user 规则消息，
-  //    system 只留已验证 200 的中性句 ⇒ 宪法/技能/启动包不再丢，且通常只需重试 1 次。
+  // 0) ★ 2026-11-07 system-rules-sink：完整规则下沉（2026-11-08 起也是默认首发形态）。
+  //    命中 11128 时（或 SYSTEM_SINK_FIRST 首发时），第一候选把全部 system 原文
+  //    逐字搬进一条权威 user 规则消息，system 只留已验证 200 的中性句 ⇒
+  //    宪法/技能/启动包不再丢，且通常只需一次请求。
   //    若新候选仍被拒，下面 1~4 的原版候选照旧工作，行为与改前完全一致，绝不更差。
+  //    opts.sinkEnv 只用于首发：强制关掉 A 类轻链，避免误判吃掉真业务单；
+  //    不传时完全沿用进程环境（11128 兜底链行为一字不变）。
   if (SYSTEM_SINK.enabled) {
-    const sink = sinkCandidate(payload, { neutralSystem: NEUTRAL_SYSTEM });
+    const sink = sinkCandidate(payload, { neutralSystem: NEUTRAL_SYSTEM, env: opts.sinkEnv });
     if (sink) {
       push(sink.strategy, sink.payload.messages);
       log(`channel fallback: ${sink.strategy} keeps ${sink.stats.movedChars} chars`
@@ -377,6 +400,25 @@ function channelFallbackCandidates(payload) {
     ...messages.filter((m) => !isSystem(m)),
   ]);
   return out;
+}
+
+/**
+ * 首发链（桥本体第 4 刀）：sink（非轻链）→ 原版全部降级候选 → original-payload。
+ *
+ * 只**构造**候选、不发请求；首包仍由调用方正常取限流许可。返回 null 表示
+ * 完全不启用首发（开关关 / sink 关 / 这条 payload 没有 system / 构造不出 sink），
+ * 调用方随即回到改前的 11128 降级流程，绝不更差。
+ */
+function firstSinkCandidates(payload) {
+  if (!SYSTEM_SINK_FIRST || !SYSTEM_SINK.enabled || !CHANNEL_FALLBACK_ENABLED) return null;
+  const messages = Array.isArray(payload?.messages) ? payload.messages : [];
+  const hasSystem = messages.some((m) => m && (m.role === 'system' || m.role === 'System'));
+  if (!hasSystem) return null;
+  const cs = channelFallbackCandidates(payload, { sinkEnv: SINK_FIRST_SINK_ENV });
+  const at = cs.findIndex((c) => c.strategy === 'system-rules-sink');
+  if (at < 0) return null;
+  return [cs[at], ...cs.slice(0, at), ...cs.slice(at + 1),
+    { strategy: 'original-payload', payload }];
 }
 
 /**
@@ -5406,9 +5448,13 @@ async function callUpstreamWithChannelFallback(payload, model, conversationId, c
   let payloadForUpstream = withBodyId(payload);
   const llmFallbackDeps = { readFailure, callUpstream, conversationId, clientSignal, log, backupModel: LLM_FALLBACK_MODEL };
   const sticky = stickyPeek(conversationId);
-  let stickyFirst = !!(sticky && sticky.sinkFirst);
+  // ★ 桥本体第 4 刀：默认 sink 首发，不再等「连续 2 次 11128」的 sticky。
+  //   WORKBUDDY_SINK_FIRST=0 时本行退回原 sticky 判断，改前行为一字不变。
+  let stickyFirst = !!(sticky && sticky.sinkFirst) || SYSTEM_SINK_FIRST;
   let ordered = null;
   const buildOrdered = (pl) => {
+    const forced = firstSinkCandidates(pl);
+    if (forced) return forced;
     const cs = channelFallbackCandidates(pl);
     const at = cs.findIndex((c0) => c0.strategy === 'system-rules-sink');
     if (at < 0) return null;
@@ -5417,14 +5463,17 @@ async function callUpstreamWithChannelFallback(payload, model, conversationId, c
   if (stickyFirst) {
     ordered = buildOrdered(payloadForUpstream);
     if (!ordered) stickyFirst = false;
+    else log('channel fallback: sink-first (no 11128 round-trip; original payload kept as last resort)');
   }
   const finish = async (a) => applyLlmModelFallback(a, payloadForUpstream, model, llmFallbackDeps);
-  const doFirst = (pl) => stickyFirst
-    ? callUpstream(JSON.stringify(pl), model, conversationId, clientSignal, { skipRateLimit: true })
-    : callUpstream(JSON.stringify(pl), model, conversationId, clientSignal);
+  // 首发是这一轮的第一个上游请求，必须正常取限流许可；只有 11128 兜底重试
+  // （同一逻辑请求的延续）才 skipRateLimit。改前 sticky 首发会跳过限流，一并修正。
+  const doFirst = (pl) => callUpstream(JSON.stringify(pl), model, conversationId, clientSignal);
   let firstPayload = stickyFirst ? ordered[0].payload : payloadForUpstream;
   let attempt = await readFailure(await doFirst(firstPayload));
-  if (stickyFirst) attempt.fallback = ordered[0].strategy;
+  // 首发不是降级：SYSTEM_SINK_FIRST 下不写 attempt.fallback，账本里的 fallback
+  // 只在真撞 11128 并走兜底链之后才出现；回退模式（=0）保留改前的 sticky 记账。
+  if (stickyFirst && !SYSTEM_SINK_FIRST) attempt.fallback = ordered[0].strategy;
   if (!attempt.res.ok && payloadForUpstream !== payload
     && isConversationIdFieldRejected(attempt.parsed, attempt.bodyText)) {
     conversationIdBodyEnabled = false;
@@ -5437,7 +5486,8 @@ async function callUpstreamWithChannelFallback(payload, model, conversationId, c
       firstPayload = payloadForUpstream;
     }
     attempt = await readFailure(await doFirst(firstPayload));
-    if (stickyFirst && ordered) attempt.fallback = ordered[0].strategy;
+    // conversation_id 兼容性重发仍是首包，同样不算降级。
+    if (stickyFirst && ordered && !SYSTEM_SINK_FIRST) attempt.fallback = ordered[0].strategy;
   }
   if (is11128Response(attempt.res, attempt.parsed)) stickyHit(conversationId);
   else {

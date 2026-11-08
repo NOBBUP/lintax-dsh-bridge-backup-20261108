@@ -677,6 +677,8 @@ export const BRIDGE_ENV_PASSTHROUGH = Object.freeze([
   'WORKBUDDY_11128_FALLBACK',
   // 11128 降级保留完整 system 规则（默认开，0 = 回退原版）
   'WORKBUDDY_SYSTEM_SINK',
+  // 桥本体首发形态（默认开，0 = 回到「首包撞 11128 再降级」的改前行为）
+  'WORKBUDDY_SINK_FIRST',
   // 下沉链的四个细分开关（默认均开，0 = 分项回退，真机 A/B 用）
   'WORKBUDDY_A_LIGHT',
   'WORKBUDDY_STRIP_HOUSEKEEPING',

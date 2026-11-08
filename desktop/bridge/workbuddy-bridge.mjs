@@ -262,6 +262,27 @@ const NEUTRAL_SYSTEM = 'You are a helpful AI assistant.';
 // 默认开；WORKBUDDY_SYSTEM_SINK=0 可整体回退到原版 11128 降级链（真机 A/B 用）。
 const SYSTEM_SINK = readSinkConfig(process.env);
 /**
+ * ★ 2026-11-08 桥本体第 4 刀：把 system-rules-sink 从「11128 之后的降级候选」
+ *   提升为「默认首发形态」。宿主裁决：问题在插件通道，不在工作台底层逻辑；
+ *   ⛔ 不改模型、不降档、不走原生 provider，workbuddy 积分照用。
+ *
+ * 真机取证（bridge.log）：上游 11128 是稳定存在的通道模板校验。改前每一轮都
+ * 先发完整 system 撞一次 11128，再降级到 sink；本 profile 连 sticky 都没有，
+ * 等于每轮必撞；normalizePayload 还逐轮改写 system 原文。
+ * 首发直发 sink 后：① 省掉每轮一次必失败的 11128 往返；② 不再有机会落到
+ * neutral-system（整段 system 换中性句、规则全丢）；③ 规则以 user 规则消息
+ * 进模型，不再被模板改写反复篡改。
+ *
+ * 原 payload 作为兜底链最后一档 original-payload 保留，原 4 个降级候选一个不少，
+ * 所以兜底能力不减。⚠ 代价要如实记：若上游本可接受完整 system，改后规则会以
+ * user 身份进模型（优先级低于 system）；用 WORKBUDDY_SINK_FIRST=0 可一键 A/B 回退。
+ *
+ * 首发一律禁用 A 类轻链：轻链只保留在 11128 兜底链里。历史教训（12:09 真实
+ * 问题被 3 秒回成「已连接」）说明误判轻链放在首发位置会吃掉真业务单。
+ */
+const SYSTEM_SINK_FIRST = process.env.WORKBUDDY_SINK_FIRST !== '0';
+const SINK_FIRST_SINK_ENV = { ...process.env, WORKBUDDY_A_LIGHT: '0' };
+/**
  * assistant 历史也做**精确身份模板**中和（默认开）。
  *
  * 同类项目已实测（hub #574）：assistant 历史里只要出现
@@ -289,7 +310,7 @@ const TOOL_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
  * user / tool / tools 永远不动。返回**去重后的候选列表**；调用方只在仍收到
  * 11128 时才继续试下一个。
  */
-function channelFallbackCandidates(payload) {
+function channelFallbackCandidates(payload, opts = {}) {
   if (!CHANNEL_FALLBACK_ENABLED) return [];
   const messages = Array.isArray(payload?.messages) ? payload.messages : [];
   const isSystem = (m) => m && (m.role === 'system' || m.role === 'System');
@@ -304,13 +325,15 @@ function channelFallbackCandidates(payload) {
     out.push({ strategy, payload: { ...payload, messages: nextMessages } });
   };
 
-  // 0) ★ 2026-11-07 system-rules-sink：11128 时先试「完整规则下沉」。
-  //    正常请求（上游没拦）根本不会走到本函数，system 原样发送、一个字节不改。
-  //    命中 11128 时，第一候选把全部 system 原文逐字搬进一条权威 user 规则消息，
-  //    system 只留已验证 200 的中性句 ⇒ 宪法/技能/启动包不再丢，且通常只需重试 1 次。
+  // 0) ★ 2026-11-07 system-rules-sink：完整规则下沉（2026-11-08 起也是默认首发形态）。
+  //    命中 11128 时（或 SYSTEM_SINK_FIRST 首发时），第一候选把全部 system 原文
+  //    逐字搬进一条权威 user 规则消息，system 只留已验证 200 的中性句 ⇒
+  //    宪法/技能/启动包不再丢，且通常只需一次请求。
   //    若新候选仍被拒，下面 1~4 的原版候选照旧工作，行为与改前完全一致，绝不更差。
+  //    opts.sinkEnv 只用于首发：强制关掉 A 类轻链，避免误判吃掉真业务单；
+  //    不传时完全沿用进程环境（11128 兜底链行为一字不变）。
   if (SYSTEM_SINK.enabled) {
-    const sink = sinkCandidate(payload, { neutralSystem: NEUTRAL_SYSTEM });
+    const sink = sinkCandidate(payload, { neutralSystem: NEUTRAL_SYSTEM, env: opts.sinkEnv });
     if (sink) {
       push(sink.strategy, sink.payload.messages);
       log(`channel fallback: ${sink.strategy} keeps ${sink.stats.movedChars} chars`
@@ -375,6 +398,25 @@ function channelFallbackCandidates(payload) {
     ...messages.filter((m) => !isSystem(m)),
   ]);
   return out;
+}
+
+/**
+ * 首发链（桥本体第 4 刀）：sink（非轻链）→ 原版全部降级候选 → original-payload。
+ *
+ * 只**构造**候选、不发请求；首包仍由调用方正常取限流许可。返回 null 表示
+ * 完全不启用首发（开关关 / sink 关 / 这条 payload 没有 system / 构造不出 sink），
+ * 调用方随即回到改前的 11128 降级流程，绝不更差。
+ */
+function firstSinkCandidates(payload) {
+  if (!SYSTEM_SINK_FIRST || !SYSTEM_SINK.enabled || !CHANNEL_FALLBACK_ENABLED) return null;
+  const messages = Array.isArray(payload?.messages) ? payload.messages : [];
+  const hasSystem = messages.some((m) => m && (m.role === 'system' || m.role === 'System'));
+  if (!hasSystem) return null;
+  const cs = channelFallbackCandidates(payload, { sinkEnv: SINK_FIRST_SINK_ENV });
+  const at = cs.findIndex((c) => c.strategy === 'system-rules-sink');
+  if (at < 0) return null;
+  return [cs[at], ...cs.slice(0, at), ...cs.slice(at + 1),
+    { strategy: 'original-payload', payload }];
 }
 
 /**
@@ -5290,23 +5332,29 @@ async function callUpstreamWithChannelFallback(payload, model, conversationId, c
     ? { ...p, conversation_id: conversationId }
     : p);
   let payloadForUpstream = withBodyId(payload);
+  // ★ 桥本体第 4 刀：默认 sink 首发（本 profile 无 sticky，改前每轮必撞 11128）。
+  //   WORKBUDDY_SINK_FIRST=0 时 ordered 恒 null，整个流程回到改前一字不变。
+  let ordered = firstSinkCandidates(payloadForUpstream);
+  const firstPayload = (pl, chain) => (chain ? chain[0].payload : pl);
   let attempt = await readFailure(
-    await callUpstream(JSON.stringify(payloadForUpstream), model, conversationId, clientSignal),
+    await callUpstream(JSON.stringify(firstPayload(payloadForUpstream, ordered)), model, conversationId, clientSignal),
   );
   if (!attempt.res.ok && payloadForUpstream !== payload
     && isConversationIdFieldRejected(attempt.parsed, attempt.bodyText)) {
     conversationIdBodyEnabled = false;
     log('upstream rejected conversation_id body field; disabling body injection for this process');
     payloadForUpstream = payload;
+    ordered = firstSinkCandidates(payloadForUpstream);
     attempt = await readFailure(
-      await callUpstream(JSON.stringify(payloadForUpstream), model, conversationId, clientSignal),
+      await callUpstream(JSON.stringify(firstPayload(payloadForUpstream, ordered)), model, conversationId, clientSignal),
     );
   }
+  if (ordered) log('channel fallback: sink-first (no 11128 round-trip; original payload kept as last resort)');
   if (!is11128Response(attempt.res, attempt.parsed)) return attempt;
 
   let lastFallback = null;
   let tried = 0;
-  for (const candidate of channelFallbackCandidates(payloadForUpstream)) {
+  for (const candidate of (ordered ? ordered.slice(1) : channelFallbackCandidates(payloadForUpstream))) {
     if (clientSignal?.aborted) break;
     tried += 1;
     lastFallback = candidate.strategy;
