@@ -2540,9 +2540,15 @@ async function main() {
 
   // ── 监看模式 ──
   console.log('════ 会话哨兵 ────  间隔 ' + INTERVAL + 's（默认 3 分钟一轮）');
-  console.log('   【干活中】催进度：10 分钟问进度 → 20 分钟请加速 → 30 分钟要它自评（难易度/完成度/预计时间）');
-  console.log('              ⛔ 不逼它砍需求、不要求"最小可用版本"；30 分钟档之后不再催');
-  console.log('              疑似卡死：' + (STALL_SEC / 60) + ' 分钟**累计量零增长**且已催过才报（副线，不与催促抢首发）');
+  if (USE_OLD_NUDGE) {
+    console.log('   【干活中】催进度（旧三档·回退模式）：10 分钟问进度 → 20 分钟请加速 → 30 分钟要它自评');
+    console.log('              ⛔ 不逼它砍需求、不要求"最小可用版本"；30 分钟档之后不再催');
+  } else {
+    console.log('   【干活中】收口闸门：' + Math.round(STOP_MAX_SEC / 60) + ' 分钟硬上限 ⇒ 投一句「停，给结论」，同一轮只投一次');
+    console.log('              ⛔ 不发 10/20/30 分三档催办、不塞提示层；全绿提前停：'
+      + (ENABLE_EARLY_STOP ? '开' : '关（收工自检恒红）'));
+  }
+  console.log('              疑似卡死：' + (STALL_SEC / 60) + ' 分钟**累计量零增长**才报（副线）');
   console.log('                判据 = steps / toolMs / llmMs 任一涨 ⇒ 有进展；⛔ 不用 updatedAt（实测不是心跳）');
   console.log('   【已停手】压缩 ≥ ' + Math.round(COST_COMPACT / 1000) + 'k tok · 写收尾 ≥ ' + Math.round(COST_WARN / 1000)
     + 'k tok · 兜底交接 ≥ 窗口 ' + Math.round(COST_GATE_RATIO * 100) + '%（且压缩过仍超）');
